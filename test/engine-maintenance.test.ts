@@ -39,7 +39,7 @@ import {
 
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine maintain and assemble budget", () => {
-  it("drains inactive compaction debt from durable messages with no protected fresh tail", async () => {
+  it("recovers stale running compaction debt from durable messages", async () => {
     const complete = vi.fn(async () => ({
       content: [{ type: "text", text: "offline archived conversation summary" }],
     }));
@@ -77,6 +77,9 @@ describe("LcmContextEngine maintain and assemble budget", () => {
       reason: "leaf-trigger",
       tokenBudget: 4_096,
       currentTokenCount: 120,
+    });
+    await engine.getCompactionMaintenanceStore().markProactiveCompactionRunning({
+      conversationId: conversation.conversationId,
     });
     await engine.getConversationStore().archiveConversation(
       conversation.conversationId,

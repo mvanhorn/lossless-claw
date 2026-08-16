@@ -1375,7 +1375,7 @@ function getMaintenanceDebtDiagnostics(
        COUNT(*) AS count
      FROM conversation_compaction_maintenance m
      JOIN conversations c ON c.conversation_id = m.conversation_id
-     WHERE m.pending = 1
+     WHERE m.pending = 1 OR m.running = 1
      GROUP BY c.active, COALESCE(NULLIF(TRIM(m.reason), ''), 'reason unknown')
      ORDER BY c.active DESC, count DESC, reason ASC`,
   ).all() as Array<{ active: number; reason: string; count: number }>;
@@ -1391,7 +1391,7 @@ function getMaintenanceDebtDiagnostics(
        COALESCE(NULLIF(TRIM(m.reason), ''), 'reason unknown') AS reason
      FROM conversation_compaction_maintenance m
      JOIN conversations c ON c.conversation_id = m.conversation_id
-     WHERE m.pending = 1 AND c.active = 0
+     WHERE (m.pending = 1 OR m.running = 1) AND c.active = 0
      ORDER BY COALESCE(m.requested_at, m.updated_at) ASC, c.conversation_id ASC
      LIMIT ?`,
   ).all(Math.max(0, Math.floor(inactiveExampleLimit))) as Array<{

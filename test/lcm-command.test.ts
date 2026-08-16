@@ -283,6 +283,11 @@ describe("lcm command", () => {
          VALUES (?, 1, 'leaf-trigger')`,
       ).run(conversation.conversationId);
     }
+    fixture.db.prepare(
+      `UPDATE conversation_compaction_maintenance
+       SET pending = 0, running = 1, reason = 'interrupted'
+       WHERE conversation_id = ?`,
+    ).run(inactive[0]!.conversationId);
     const changesBefore = fixture.db.prepare("SELECT total_changes() AS count").get() as { count: number };
 
     const result = await fixture.command.handler(createCommandContext("maintenance"));
@@ -293,7 +298,8 @@ describe("lcm command", () => {
     expect(result.text).toContain("active pending: 1");
     expect(result.text).toContain("inactive pending: 6");
     expect(result.text).toContain("active · threshold: 1");
-    expect(result.text).toContain("inactive · leaf-trigger: 6");
+    expect(result.text).toContain("inactive · leaf-trigger: 5");
+    expect(result.text).toContain("inactive · interrupted: 1");
     expect(result.text).toContain(`conversation ${inactive[0]!.conversationId}`);
     expect(result.text).not.toContain(`conversation ${inactive[5]!.conversationId}`);
     expect(result.text).toContain("read-only: yes");

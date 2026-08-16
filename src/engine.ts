@@ -2589,20 +2589,6 @@ export class LcmContextEngine implements ContextEngine {
             reason: "no pending compaction debt",
           };
         }
-        if (maintenance?.running) {
-          return {
-            kind: "failed",
-            conversationId: params.conversationId,
-            pendingBefore: true,
-            pendingAfter: true,
-            backupPath: null,
-            changed: false,
-            rawMessageCount,
-            reason: "compaction maintenance is already running",
-            failureStage: "maintenance",
-          };
-        }
-
         let backupPath: string | null = null;
         try {
           backupPath = createLcmDatabaseBackup(this.db, {
