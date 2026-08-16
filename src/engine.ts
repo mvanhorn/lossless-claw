@@ -47,6 +47,7 @@ import {
   getLcmProgrammaticControlCapabilities,
   runLcmProgrammaticControl,
 } from "./plugin/lcm-command.js";
+import { createLcmDatabaseBackup } from "./plugin/lcm-db-backup.js";
 import { describeLcmConfigSource } from "./db/config.js";
 import { RetrievalEngine } from "./retrieval.js";
 import { compileSessionPatterns, matchesSessionPattern } from "./session-patterns.js";
@@ -151,6 +152,8 @@ type CompactionExecutionParams = {
   compactionTarget?: "budget" | "threshold";
   /** Caller-resolved threshold; skips re-resolving from runtime metadata. */
   contextThresholdOverride?: ResolvedContextThreshold;
+  /** Permit an explicit zero fresh-tail override for offline finalization. */
+  allowZeroFreshTailOverride?: boolean;
   customInstructions?: string;
   /** OpenClaw runtime param name (preferred). */
   runtimeContext?: Record<string, unknown>;
@@ -172,6 +175,18 @@ type DeferredCompactionDebtDrainParams = {
   tokenBudget: number;
   currentTokenCount?: number;
   reason: string;
+};
+
+export type InactiveCompactionDebtDrainResult = {
+  kind: "drained" | "missing" | "active" | "no_pending_debt" | "failed";
+  conversationId: number;
+  pendingBefore: boolean;
+  pendingAfter: boolean;
+  backupPath: string | null;
+  changed: boolean;
+  rawMessageCount: number;
+  reason?: string;
+  failureStage?: "backup" | "maintenance";
 };
 
 function buildContextEngineProjectionEpoch(
@@ -831,6 +846,8 @@ export class LcmContextEngine implements ContextEngine {
     legacyParams?: Record<string, unknown>;
     /** When true, skip the backoff check — used by assemble emergency drain. */
     force?: boolean;
+    /** Explicit operator-confirmed finalization for an inactive conversation. */
+    offlineFinalization?: boolean;
   }): Promise<(ContextEngineMaintenanceResult & { exhausted?: boolean }) | null> {
     const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
       params.conversationId,
@@ -939,7 +956,7 @@ export class LcmContextEngine implements ContextEngine {
           : reconciledContextThreshold.resolved;
 
       const isThresholdDebt = maintenance.reason?.trim() === "threshold";
-      if (!isThresholdDebt) {
+      if (!isThresholdDebt && !params.offlineFinalization) {
         const thresholdDecision = await this.compaction.evaluate(
           params.conversationId,
           resolvedTokenBudget,
@@ -984,14 +1001,20 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
+      const compactionThreshold = params.offlineFinalization
+        ? { ...resolvedContextThreshold, freshTailCount: 0 }
+        : resolvedContextThreshold;
       const result = await this.executeCompactionCore({
         conversationId: params.conversationId,
         sessionId: params.sessionId,
         sessionKey: params.sessionKey,
         tokenBudget: resolvedTokenBudget,
-        currentTokenCount: resolvedCurrentTokenCount,
+        ...(!params.offlineFinalization && resolvedCurrentTokenCount !== undefined
+          ? { currentTokenCount: resolvedCurrentTokenCount }
+          : {}),
         compactionTarget: "threshold",
-        contextThresholdOverride: resolvedContextThreshold,
+        contextThresholdOverride: compactionThreshold,
+        ...(params.offlineFinalization ? { allowZeroFreshTailOverride: true } : {}),
         runtimeContext: params.runtimeContext,
         legacyParams: params.legacyParams,
         force: params.force,
@@ -1004,6 +1027,7 @@ export class LcmContextEngine implements ContextEngine {
       // recovery keeps the honest signal; only the deferred-debt maintenance
       // treats it as done.
       const compactionExhausted =
+        !params.offlineFinalization &&
         (result as { exhausted?: boolean }).exhausted === true;
       const keepPending =
         (!result.ok || blockedByAuthCircuitBreaker) && !compactionExhausted;
@@ -1336,6 +1360,7 @@ export class LcmContextEngine implements ContextEngine {
           ...(resolvedContextThreshold.freshTailCount !== undefined
             ? { freshTailCount: resolvedContextThreshold.freshTailCount }
             : {}),
+          ...(params.allowZeroFreshTailOverride ? { allowZeroFreshTailOverride: true } : {}),
           ...(resolvedContextThreshold.leafChunkTokens !== undefined
             ? { leafChunkTokens: resolvedContextThreshold.leafChunkTokens }
             : {}),
@@ -1552,6 +1577,9 @@ export class LcmContextEngine implements ContextEngine {
         contextThreshold: resolvedContextThreshold.contextThreshold,
         ...(resolvedContextThreshold.freshTailCount !== undefined
           ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+          : {}),
+        ...(params.allowZeroFreshTailOverride
+          ? { allowZeroFreshTailOverride: true }
           : {}),
         ...(resolvedContextThreshold.leafChunkTokens !== undefined
           ? { leafChunkTokens: resolvedContextThreshold.leafChunkTokens }
@@ -2477,6 +2505,185 @@ export class LcmContextEngine implements ContextEngine {
       content,
       ...(isError !== undefined ? { isError } : {}),
     } as AgentMessage;
+  }
+
+  /**
+   * Finalize one inactive conversation's deferred compaction debt from durable
+   * database content. This operator-only path never reads or rewrites a runtime
+   * transcript and never deletes raw message rows.
+   */
+  async drainInactiveCompactionDebt(params: {
+    conversationId: number;
+  }): Promise<InactiveCompactionDebtDrainResult> {
+    const selectedConversation = await this.conversationStore.getConversation(
+      params.conversationId,
+    );
+    if (!selectedConversation) {
+      return {
+        kind: "missing",
+        conversationId: params.conversationId,
+        pendingBefore: false,
+        pendingAfter: false,
+        backupPath: null,
+        changed: false,
+        rawMessageCount: 0,
+        reason: "conversation not found",
+      };
+    }
+
+    const queueKey = this.resolveSessionQueueKey(
+      selectedConversation.sessionId,
+      selectedConversation.sessionKey ?? undefined,
+    );
+    return this.withSessionQueue(
+      queueKey,
+      async () => {
+        // Re-read both records after queue acquisition. A conversation that
+        // became active while this operation waited must remain live and
+        // untouched.
+        const conversation = await this.conversationStore.getConversation(
+          params.conversationId,
+        );
+        if (!conversation) {
+          return {
+            kind: "missing",
+            conversationId: params.conversationId,
+            pendingBefore: false,
+            pendingAfter: false,
+            backupPath: null,
+            changed: false,
+            rawMessageCount: 0,
+            reason: "conversation not found after queue acquisition",
+          };
+        }
+
+        const maintenance =
+          await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+            params.conversationId,
+          );
+        const pendingBefore = Boolean(maintenance?.pending || maintenance?.running);
+        const rawMessageCount = await this.conversationStore.getMessageCount(
+          params.conversationId,
+        );
+        if (conversation.active) {
+          return {
+            kind: "active",
+            conversationId: params.conversationId,
+            pendingBefore,
+            pendingAfter: pendingBefore,
+            backupPath: null,
+            changed: false,
+            rawMessageCount,
+            reason: "active conversations cannot be finalized offline",
+          };
+        }
+        if (!pendingBefore) {
+          return {
+            kind: "no_pending_debt",
+            conversationId: params.conversationId,
+            pendingBefore: false,
+            pendingAfter: false,
+            backupPath: null,
+            changed: false,
+            rawMessageCount,
+            reason: "no pending compaction debt",
+          };
+        }
+        if (maintenance?.running) {
+          return {
+            kind: "failed",
+            conversationId: params.conversationId,
+            pendingBefore: true,
+            pendingAfter: true,
+            backupPath: null,
+            changed: false,
+            rawMessageCount,
+            reason: "compaction maintenance is already running",
+            failureStage: "maintenance",
+          };
+        }
+
+        let backupPath: string | null = null;
+        try {
+          backupPath = createLcmDatabaseBackup(this.db, {
+            databasePath: this.config.databasePath,
+            label: `offline-compaction-debt-${params.conversationId}`,
+          });
+          if (!backupPath) {
+            throw new Error("Lossless Claw could not determine a backup path");
+          }
+        } catch (error) {
+          return {
+            kind: "failed",
+            conversationId: params.conversationId,
+            pendingBefore: true,
+            pendingAfter: true,
+            backupPath: null,
+            changed: false,
+            rawMessageCount,
+            reason: describeLogError(error),
+            failureStage: "backup",
+          };
+        }
+
+        const storedTokens = await this.summaryStore.getContextTokenCount(
+          params.conversationId,
+        );
+        const tokenBudget = Math.max(
+          1,
+          maintenance?.tokenBudget ??
+            maintenance?.currentTokenCount ??
+            storedTokens,
+        );
+        const drainResult = await this.consumeDeferredCompactionDebt({
+          conversationId: params.conversationId,
+          sessionId: conversation.sessionId,
+          ...(conversation.sessionKey ? { sessionKey: conversation.sessionKey } : {}),
+          tokenBudget,
+          force: true,
+          offlineFinalization: true,
+        });
+        const finalMaintenance =
+          await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+            params.conversationId,
+          );
+        const pendingAfter = Boolean(finalMaintenance?.pending || finalMaintenance?.running);
+        const finalRawMessageCount = await this.conversationStore.getMessageCount(
+          params.conversationId,
+        );
+        if (pendingAfter || finalRawMessageCount !== rawMessageCount) {
+          return {
+            kind: "failed",
+            conversationId: params.conversationId,
+            pendingBefore: true,
+            pendingAfter,
+            backupPath,
+            changed: drainResult?.changed ?? false,
+            rawMessageCount: finalRawMessageCount,
+            reason:
+              finalRawMessageCount !== rawMessageCount
+                ? "raw message preservation check failed"
+                : drainResult?.reason ?? "offline compaction did not converge",
+            failureStage: "maintenance",
+          };
+        }
+
+        return {
+          kind: "drained",
+          conversationId: params.conversationId,
+          pendingBefore: true,
+          pendingAfter: false,
+          backupPath,
+          changed: drainResult?.changed ?? false,
+          rawMessageCount: finalRawMessageCount,
+          ...(drainResult?.reason ? { reason: drainResult.reason } : {}),
+        };
+      },
+      {
+        operationName: "offlineCompactionDebtDrain",
+        context: `conversation=${params.conversationId}`,
+      },
+    );
   }
 
   /**

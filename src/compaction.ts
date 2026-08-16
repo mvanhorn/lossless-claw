@@ -781,6 +781,8 @@ export class CompactionEngine {
     contextThreshold?: number;
     /** Optional per-call override for freshTailCount. */
     freshTailCount?: number;
+    /** Permit an explicit zero fresh-tail override for offline finalization. */
+    allowZeroFreshTailOverride?: boolean;
     /** LLM call function for summarization */
     summarize: CompactionSummarizeFn;
     force?: boolean;
@@ -963,6 +965,8 @@ export class CompactionEngine {
     contextThreshold?: number;
     /** Optional per-call override for freshTailCount. */
     freshTailCount?: number;
+    /** Permit an explicit zero fresh-tail override for offline finalization. */
+    allowZeroFreshTailOverride?: boolean;
     /** Optional per-call override for leafChunkTokens. */
     leafChunkTokens?: number;
     summarize: CompactionSummarizeFn;
@@ -982,6 +986,7 @@ export class CompactionEngine {
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
     const freshTailCountOverride = input.freshTailCount;
+    const allowZeroFreshTailOverride = input.allowZeroFreshTailOverride === true;
     const leafChunkTokensOverride = input.leafChunkTokens;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
@@ -1093,6 +1098,7 @@ export class CompactionEngine {
         leafChunkTokensOverride,
         freshTailCountOverride,
         leafScanAfterOrdinal,
+        allowZeroFreshTailOverride,
       );
       if (leafChunk.items.length === 0) {
         break;
@@ -1159,7 +1165,11 @@ export class CompactionEngine {
       contextThreshold,
     );
     const hasSummaryPrefixPressure = async (): Promise<boolean> =>
-      (await this.countSummaryTokensOutsideFreshTail(conversationId, freshTailCountOverride)) > summaryPrefixTargetTokens;
+      (await this.countSummaryTokensOutsideFreshTail(
+        conversationId,
+        freshTailCountOverride,
+        allowZeroFreshTailOverride,
+      )) > summaryPrefixTargetTokens;
     const hasStopTargetPressure = (): boolean =>
       stopAtTokens !== undefined && runningTokens > stopAtTokens;
     const hasCondensationPressure = async (): Promise<boolean> =>
@@ -1296,6 +1306,8 @@ export class CompactionEngine {
     contextThreshold?: number;
     /** Optional per-call override for freshTailCount. */
     freshTailCount?: number;
+    /** Permit an explicit zero fresh-tail override for offline finalization. */
+    allowZeroFreshTailOverride?: boolean;
     /** Optional per-call override for leafChunkTokens. */
     leafChunkTokens?: number;
     targetTokens?: number;
@@ -1312,6 +1324,8 @@ export class CompactionEngine {
     contextThreshold?: number;
     /** Optional per-call override for freshTailCount. */
     freshTailCount?: number;
+    /** Permit an explicit zero fresh-tail override for offline finalization. */
+    allowZeroFreshTailOverride?: boolean;
     /** Optional per-call override for leafChunkTokens. */
     leafChunkTokens?: number;
     targetTokens?: number;
@@ -1376,6 +1390,9 @@ export class CompactionEngine {
         contextThreshold: input.contextThreshold,
         ...(input.freshTailCount !== undefined
           ? { freshTailCount: input.freshTailCount }
+          : {}),
+        ...(input.allowZeroFreshTailOverride
+          ? { allowZeroFreshTailOverride: true }
           : {}),
         ...(input.leafChunkTokens !== undefined
           ? { leafChunkTokens: input.leafChunkTokens }
@@ -1478,10 +1495,14 @@ export class CompactionEngine {
     contextItems: ContextItemRecord[],
     freshTailCountOverride?: number,
     messageCache = new Map<number, MessageRecord | null>(),
+    allowZeroFreshTailOverride = false,
   ): Promise<number> {
     const freshTailCount =
-      (freshTailCountOverride !== undefined && freshTailCountOverride > 0
-        ? freshTailCountOverride
+      (freshTailCountOverride !== undefined &&
+      Number.isFinite(freshTailCountOverride) &&
+      (freshTailCountOverride > 0 ||
+        (allowZeroFreshTailOverride && freshTailCountOverride === 0))
+        ? Math.floor(freshTailCountOverride)
         : this.resolveFreshTailCount());
     if (freshTailCount <= 0) {
       return Infinity;
@@ -1607,9 +1628,15 @@ export class CompactionEngine {
   private async countSummaryTokensOutsideFreshTail(
     conversationId: number,
     freshTailCountOverride?: number,
+    allowZeroFreshTailOverride = false,
   ): Promise<number> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems, freshTailCountOverride);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(
+      contextItems,
+      freshTailCountOverride,
+      undefined,
+      allowZeroFreshTailOverride,
+    );
     let summaryTokens = 0;
 
     for (const item of contextItems) {
@@ -1639,9 +1666,15 @@ export class CompactionEngine {
     leafChunkTokensOverride?: number,
     freshTailCountOverride?: number,
     afterOrdinal?: number,
+    allowZeroFreshTailOverride = false,
   ): Promise<LeafChunkSelection> {
     const contextItems = await this.getContextItemsCached(conversationId);
-    const freshTailOrdinal = await this.resolveFreshTailOrdinal(contextItems, freshTailCountOverride);
+    const freshTailOrdinal = await this.resolveFreshTailOrdinal(
+      contextItems,
+      freshTailCountOverride,
+      undefined,
+      allowZeroFreshTailOverride,
+    );
     const threshold = this.resolveLeafChunkTokens(leafChunkTokensOverride);
 
     let rawTokensOutsideTail = 0;

@@ -255,6 +255,122 @@ describe("lcm command", () => {
     tempDirs.clear();
   });
 
+  it("reports read-only maintenance debt grouped by active state and reason", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const active = await fixture.conversationStore.createConversation({
+      sessionId: "maintenance-active",
+      sessionKey: "agent:main:test:maintenance-active",
+    });
+    const inactive = await Promise.all(
+      Array.from({ length: 6 }, (_, index) =>
+        fixture.conversationStore.createConversation({
+          sessionId: `maintenance-inactive-${index}`,
+          sessionKey: `agent:main:test:maintenance-inactive-${index}`,
+          active: false,
+          archivedAt: new Date(),
+        }),
+      ),
+    );
+    fixture.db.prepare(
+      `INSERT INTO conversation_compaction_maintenance (conversation_id, pending, reason)
+       VALUES (?, 1, 'threshold')`,
+    ).run(active.conversationId);
+    for (const conversation of inactive) {
+      fixture.db.prepare(
+        `INSERT INTO conversation_compaction_maintenance (conversation_id, pending, reason)
+         VALUES (?, 1, 'leaf-trigger')`,
+      ).run(conversation.conversationId);
+    }
+    const changesBefore = fixture.db.prepare("SELECT total_changes() AS count").get() as { count: number };
+
+    const result = await fixture.command.handler(createCommandContext("maintenance"));
+
+    const changesAfter = fixture.db.prepare("SELECT total_changes() AS count").get() as { count: number };
+    expect(changesAfter.count).toBe(changesBefore.count);
+    expect(result.text).toContain("Lossless Claw Maintenance");
+    expect(result.text).toContain("active pending: 1");
+    expect(result.text).toContain("inactive pending: 6");
+    expect(result.text).toContain("active · threshold: 1");
+    expect(result.text).toContain("inactive · leaf-trigger: 6");
+    expect(result.text).toContain(`conversation ${inactive[0]!.conversationId}`);
+    expect(result.text).not.toContain(`conversation ${inactive[5]!.conversationId}`);
+    expect(result.text).toContain("read-only: yes");
+  });
+
+  it("previews a maintenance drain without confirmation and performs no engine call", async () => {
+    const drainInactiveCompactionDebt = vi.fn();
+    const fixture = createCommandFixture({
+      getLcm: async () => ({ drainInactiveCompactionDebt }),
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "maintenance-preview",
+      active: false,
+      archivedAt: new Date(),
+    });
+    fixture.db.prepare(
+      `INSERT INTO conversation_compaction_maintenance (conversation_id, pending, reason)
+       VALUES (?, 1, 'threshold')`,
+    ).run(conversation.conversationId);
+
+    const result = await fixture.command.handler(
+      createCommandContext(`maintenance drain ${conversation.conversationId}`),
+    );
+
+    expect(drainInactiveCompactionDebt).not.toHaveBeenCalled();
+    expect(result.text).toContain("preview only");
+    expect(result.text).toContain(
+      `/lossless maintenance drain ${conversation.conversationId} confirm-offline`,
+    );
+  });
+
+  it("runs a confirmed single-target maintenance drain and reports backup and debt state", async () => {
+    const drainInactiveCompactionDebt = vi.fn(async (
+      { conversationId }: { conversationId: number },
+    ) => ({
+      kind: "drained" as const,
+      conversationId,
+      pendingBefore: true,
+      pendingAfter: false,
+      backupPath: "/tmp/lcm.offline-compaction-debt.bak",
+      changed: true,
+      reason: "compacted",
+      rawMessageCount: 4,
+    }));
+    const fixture = createCommandFixture({
+      getLcm: async () => ({ drainInactiveCompactionDebt }),
+    });
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "maintenance-confirmed",
+      active: false,
+      archivedAt: new Date(),
+    });
+    fixture.db.prepare(
+      `INSERT INTO conversation_compaction_maintenance (conversation_id, pending, reason)
+       VALUES (?, 1, 'leaf-trigger')`,
+    ).run(conversation.conversationId);
+
+    const result = await fixture.command.handler(
+      createCommandContext(
+        `maintenance drain ${conversation.conversationId} confirm-offline`,
+      ),
+    );
+
+    expect(drainInactiveCompactionDebt).toHaveBeenCalledWith({
+      conversationId: conversation.conversationId,
+    });
+    expect(result.text).toContain("result: drained");
+    expect(result.text).toContain("pending before: yes");
+    expect(result.text).toContain("pending after: no");
+    expect(result.text).toContain("backup path: /tmp/lcm.offline-compaction-debt.bak");
+    expect(result.text).toContain("raw messages preserved: 4");
+  });
+
   it("reports compact global status and help hints", async () => {
     const fixture = createCommandFixture();
     tempDirs.add(fixture.tempDir);

@@ -4,7 +4,10 @@ import { DatabaseSync } from "node:sqlite";
 import packageJson from "../../package.json" with { type: "json" };
 import { formatTimestamp } from "../compaction.js";
 import { resolveOpenclawStateDir, type LcmConfig } from "../db/config.js";
-import type { RotateSessionStorageWithBackupResult } from "../engine.js";
+import type {
+  InactiveCompactionDebtDrainResult,
+  RotateSessionStorageWithBackupResult,
+} from "../engine.js";
 import { runDelegatedFocusBrief, runDelegatedRefocusBrief } from "../focus-briefs.js";
 import type { LcmSummarizeFn } from "../summarize.js";
 import type { LcmDependencies } from "../types.js";
@@ -91,6 +94,21 @@ type DoctorApplyOptions = {
   confirmOffline: boolean;
   conversationId?: number;
 };
+type MaintenanceDrainOptions = {
+  conversationId?: number;
+  confirmOffline: boolean;
+};
+type MaintenanceDebtDiagnostics = {
+  totalPending: number;
+  activePending: number;
+  inactivePending: number;
+  groups: Array<{ active: boolean; reason: string; count: number }>;
+  inactiveExamples: Array<{
+    conversationId: number;
+    sessionKey: string | null;
+    reason: string;
+  }>;
+};
 type DoctorApplyRepairMetrics = {
   repairInputTokenCount: number;
   repairTargetSourceTokenCount: number;
@@ -108,6 +126,7 @@ type ParsedLcmCommand =
   | { kind: "status" }
   | { kind: "backup" }
   | { kind: "rotate" }
+  | { kind: "maintenance"; options: MaintenanceDrainOptions }
   | { kind: "focus_status" }
   | { kind: "focus_generate"; prompt: string }
   | { kind: "refocus" }
@@ -140,7 +159,14 @@ type FocusCompactionCommandEngine = {
   }): Promise<CompactResult>;
 };
 
-type RuntimeCommandEngine = RotateCommandEngine & Partial<FocusCompactionCommandEngine>;
+type OfflineMaintenanceCommandEngine = {
+  drainInactiveCompactionDebt(params: {
+    conversationId: number;
+  }): Promise<InactiveCompactionDebtDrainResult>;
+};
+
+type RuntimeCommandEngine = RotateCommandEngine &
+  Partial<FocusCompactionCommandEngine & OfflineMaintenanceCommandEngine>;
 
 /** Error thrown when a host requests a control operation that cannot run safely. */
 export class LcmProgrammaticControlUnavailableError extends Error {
@@ -584,6 +610,44 @@ function parseRolloverSplitApplyArgs(tokens: string[]):
   };
 }
 
+function parseMaintenanceArgs(tokens: string[]):
+  | { ok: true; options: MaintenanceDrainOptions }
+  | { ok: false; error: string } {
+  if (tokens.length === 0) {
+    return { ok: true, options: { confirmOffline: false } };
+  }
+  if (tokens[0]?.toLowerCase() !== "drain" || tokens.length < 2 || tokens.length > 3) {
+    return {
+      ok: false,
+      error: `\`${VISIBLE_COMMAND} maintenance\` accepts no arguments or \`drain <conversation-id> [confirm-offline]\`.`,
+    };
+  }
+  const conversationId = Number(tokens[1]);
+  if (
+    !Number.isSafeInteger(conversationId) ||
+    conversationId <= 0 ||
+    String(conversationId) !== tokens[1]
+  ) {
+    return {
+      ok: false,
+      error: `\`${VISIBLE_COMMAND} maintenance drain\` requires a positive conversation id.`,
+    };
+  }
+  if (tokens.length === 3 && tokens[2]?.toLowerCase() !== "confirm-offline") {
+    return {
+      ok: false,
+      error: `\`${VISIBLE_COMMAND} maintenance drain <conversation-id>\` accepts only \`confirm-offline\`.`,
+    };
+  }
+  return {
+    ok: true,
+    options: {
+      conversationId,
+      confirmOffline: tokens.length === 3,
+    },
+  };
+}
+
 function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
   const raw = (rawArgs ?? "").trim();
   if (raw === "") {
@@ -629,6 +693,12 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
             kind: "help",
             error: `\`${VISIBLE_COMMAND} rotate\` does not accept extra arguments.`,
           };
+    case "maintenance": {
+      const parsedMaintenance = parseMaintenanceArgs(rest);
+      return parsedMaintenance.ok
+        ? { kind: "maintenance", options: parsedMaintenance.options }
+        : { kind: "help", error: parsedMaintenance.error };
+    }
     case "doctor":
       if (rest.length === 0) {
         return { kind: "doctor", apply: false };
@@ -676,7 +746,7 @@ function parseLcmCommand(rawArgs: string | undefined): ParsedLcmCommand {
     default:
       return {
         kind: "help",
-        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, rotate, doctor, doctor clean, doctor apply, help.`,
+        error: `Unknown subcommand \`${head}\`. Supported: status, focus, refocus, unfocus, backup, rotate, maintenance, doctor, doctor clean, doctor apply, help.`,
       };
   }
 }
@@ -1294,6 +1364,182 @@ function resolveDbSizeLabel(dbPath: string): string {
   }
 }
 
+function getMaintenanceDebtDiagnostics(
+  db: DatabaseSync,
+  inactiveExampleLimit = 5,
+): MaintenanceDebtDiagnostics {
+  const groups = db.prepare(
+    `SELECT
+       c.active,
+       COALESCE(NULLIF(TRIM(m.reason), ''), 'reason unknown') AS reason,
+       COUNT(*) AS count
+     FROM conversation_compaction_maintenance m
+     JOIN conversations c ON c.conversation_id = m.conversation_id
+     WHERE m.pending = 1
+     GROUP BY c.active, COALESCE(NULLIF(TRIM(m.reason), ''), 'reason unknown')
+     ORDER BY c.active DESC, count DESC, reason ASC`,
+  ).all() as Array<{ active: number; reason: string; count: number }>;
+  const normalizedGroups = groups.map((group) => ({
+    active: group.active === 1,
+    reason: group.reason,
+    count: group.count,
+  }));
+  const inactiveExamples = db.prepare(
+    `SELECT
+       c.conversation_id,
+       c.session_key,
+       COALESCE(NULLIF(TRIM(m.reason), ''), 'reason unknown') AS reason
+     FROM conversation_compaction_maintenance m
+     JOIN conversations c ON c.conversation_id = m.conversation_id
+     WHERE m.pending = 1 AND c.active = 0
+     ORDER BY COALESCE(m.requested_at, m.updated_at) ASC, c.conversation_id ASC
+     LIMIT ?`,
+  ).all(Math.max(0, Math.floor(inactiveExampleLimit))) as Array<{
+    conversation_id: number;
+    session_key: string | null;
+    reason: string;
+  }>;
+  const activePending = normalizedGroups
+    .filter((group) => group.active)
+    .reduce((total, group) => total + group.count, 0);
+  const inactivePending = normalizedGroups
+    .filter((group) => !group.active)
+    .reduce((total, group) => total + group.count, 0);
+  return {
+    totalPending: activePending + inactivePending,
+    activePending,
+    inactivePending,
+    groups: normalizedGroups,
+    inactiveExamples: inactiveExamples.map((example) => ({
+      conversationId: example.conversation_id,
+      sessionKey: example.session_key,
+      reason: example.reason,
+    })),
+  };
+}
+
+function buildMaintenanceDiagnosticsLines(diagnostics: MaintenanceDebtDiagnostics): string[] {
+  const groupLines = diagnostics.groups.length > 0
+    ? diagnostics.groups.map((group) =>
+        `${group.active ? "active" : "inactive"} · ${group.reason}: ${formatNumber(group.count)}`,
+      )
+    : ["pending debt: none"];
+  const exampleLines = diagnostics.inactiveExamples.length > 0
+    ? diagnostics.inactiveExamples.map((example) => {
+        const session = example.sessionKey
+          ? ` · session key ${formatCommand(truncateMiddle(example.sessionKey, 44))}`
+          : "";
+        return `conversation ${example.conversationId} · ${example.reason}${session}`;
+      })
+    : ["none"];
+  return [
+    buildSection("📊 Pending debt", [
+      buildStatLine("read-only", "yes"),
+      buildStatLine("total pending", formatNumber(diagnostics.totalPending)),
+      buildStatLine("active pending", formatNumber(diagnostics.activePending)),
+      buildStatLine("inactive pending", formatNumber(diagnostics.inactivePending)),
+      ...groupLines,
+    ]),
+    "",
+    buildSection("🗄️ Inactive examples", exampleLines),
+  ];
+}
+
+async function buildMaintenanceText(params: {
+  db: DatabaseSync;
+  options: MaintenanceDrainOptions;
+  getLcm?: () => Promise<RuntimeCommandEngine>;
+}): Promise<string> {
+  const lines = [
+    ...buildHeaderLines(),
+    "",
+    "🛠️ Lossless Claw Maintenance",
+    "",
+    ...buildMaintenanceDiagnosticsLines(getMaintenanceDebtDiagnostics(params.db)),
+  ];
+  const conversationId = params.options.conversationId;
+  if (conversationId === undefined) {
+    lines.push(
+      "",
+      buildSection("▶️ Drain workflow", [
+        buildStatLine(
+          "preview",
+          formatCommand(`${VISIBLE_COMMAND} maintenance drain <conversation-id>`),
+        ),
+        buildStatLine(
+          "confirm",
+          formatCommand(
+            `${VISIBLE_COMMAND} maintenance drain <conversation-id> confirm-offline`,
+          ),
+        ),
+        buildStatLine("scope", "one inactive conversation; raw messages are retained"),
+      ]),
+    );
+    return lines.join("\n");
+  }
+
+  const target = params.db.prepare(
+    `SELECT
+       c.active,
+       m.pending,
+       m.running,
+       m.reason
+     FROM conversations c
+     LEFT JOIN conversation_compaction_maintenance m
+       ON m.conversation_id = c.conversation_id
+     WHERE c.conversation_id = ?`,
+  ).get(conversationId) as {
+    active: number;
+    pending: number | null;
+    running: number | null;
+    reason: string | null;
+  } | undefined;
+  lines.push("", `**🎯 Conversation ${conversationId}**`);
+  if (!target) {
+    lines.push("  result: conversation not found", "  writes: none");
+    return lines.join("\n");
+  }
+  lines.push(
+    `  active: ${formatBoolean(target.active === 1)}`,
+    `  pending: ${formatBoolean(target.pending === 1)}`,
+    `  running: ${formatBoolean(target.running === 1)}`,
+    `  reason: ${target.reason ?? "reason unknown"}`,
+  );
+  if (!params.options.confirmOffline) {
+    lines.push(
+      "  result: preview only; no writes performed",
+      `  confirm: ${formatCommand(`${VISIBLE_COMMAND} maintenance drain ${conversationId} confirm-offline`)}`,
+    );
+    return lines.join("\n");
+  }
+  if (!params.getLcm) {
+    lines.push("  result: failed", "  reason: runtime engine unavailable", "  writes: none");
+    return lines.join("\n");
+  }
+  const engine = await params.getLcm();
+  if (typeof engine.drainInactiveCompactionDebt !== "function") {
+    lines.push(
+      "  result: failed",
+      "  reason: the active runtime does not support offline compaction debt draining",
+      "  writes: none",
+    );
+    return lines.join("\n");
+  }
+  const result = await engine.drainInactiveCompactionDebt({ conversationId });
+  lines.push(
+    `  result: ${result.kind}`,
+    `  pending before: ${formatBoolean(result.pendingBefore)}`,
+    `  pending after: ${formatBoolean(result.pendingAfter)}`,
+    `  backup path: ${result.backupPath ?? "skipped (no writes)"}`,
+    `  raw messages preserved: ${formatNumber(result.rawMessageCount)}`,
+    `  changed: ${formatBoolean(result.changed)}`,
+  );
+  if (result.reason) {
+    lines.push(`  reason: ${result.reason}`);
+  }
+  return lines.join("\n");
+}
+
 function buildHelpText(error?: string): string {
   const lines = [
     ...(error ? [`⚠️ ${error}`, ""] : []),
@@ -1312,6 +1558,14 @@ function buildHelpText(error?: string): string {
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} rotate`),
         "Compact the current session transcript while preserving the same LCM conversation and live session identity.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} maintenance`),
+        "Show read-only active/inactive pending compaction debt grouped by reason.",
+      ),
+      buildStatLine(
+        formatCommand(`${VISIBLE_COMMAND} maintenance drain <conversation-id> confirm-offline`),
+        "Backup and finalize one inactive conversation from durable LCM messages.",
       ),
       buildStatLine(
         formatCommand(`${VISIBLE_COMMAND} focus <prompt>`),
@@ -3342,6 +3596,14 @@ export function createLcmCommand(params: {
               getLcm: params.getLcm,
             }),
           };
+        case "maintenance":
+          return {
+            text: await buildMaintenanceText({
+              db: await getDb(),
+              options: parsed.options,
+              getLcm: params.getLcm,
+            }),
+          };
         case "focus_status":
           return { text: await buildFocusStatusText({ ctx, db: await getDb(), config: params.config }) };
         case "focus_generate":
@@ -3443,6 +3705,7 @@ export const __testing = {
   getDoctorSummaryStats,
   getLcmStatusStats,
   getConversationStatusStats,
+  getMaintenanceDebtDiagnostics,
   scanDoctorCleaners,
   resolveCurrentConversation,
   resolveContextEngineSlot,

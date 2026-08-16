@@ -39,6 +39,242 @@ import {
 
 afterEach(cleanupEngineTestState);
 describe("LcmContextEngine maintain and assemble budget", () => {
+  it("drains inactive compaction debt from durable messages with no protected fresh tail", async () => {
+    const complete = vi.fn(async () => ({
+      content: [{ type: "text", text: "offline archived conversation summary" }],
+    }));
+    const engine = createEngineWithDeps(
+      {
+        freshTailCount: 8,
+        leafChunkTokens: 40,
+        leafMinFanout: 2,
+        summaryProvider: "anthropic",
+        summaryModel: "claude-opus-4-5",
+      },
+      { complete },
+    );
+    const conversation = await engine.getConversationStore().createConversation({
+      sessionId: "offline-debt-session",
+      sessionKey: "agent:main:test:offline-debt",
+    });
+    const messages = await engine.getConversationStore().createMessagesBulk(
+      Array.from({ length: 4 }, (_, index) => ({
+        conversationId: conversation.conversationId,
+        seq: index,
+        role: index % 2 === 0 ? "user" as const : "assistant" as const,
+        content: `archived durable message ${index} ${"detail ".repeat(20)}`,
+        tokenCount: 30,
+      })),
+    );
+    for (const message of messages) {
+      await engine.getSummaryStore().appendContextMessage(
+        conversation.conversationId,
+        message.messageId,
+      );
+    }
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "leaf-trigger",
+      tokenBudget: 4_096,
+      currentTokenCount: 120,
+    });
+    await engine.getConversationStore().archiveConversation(
+      conversation.conversationId,
+      "session-end",
+    );
+
+    const result = await engine.drainInactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+    });
+
+    expect(result.kind).toBe("drained");
+    expect(result.backupPath).toBeTruthy();
+    expect(statSync(result.backupPath!)).toBeTruthy();
+    expect(complete).toHaveBeenCalled();
+    await expect(
+      engine.getConversationStore().getMessageCount(conversation.conversationId),
+    ).resolves.toBe(messages.length);
+    expect(
+      await engine.getSummaryStore().getSummariesByConversation(conversation.conversationId),
+    ).not.toHaveLength(0);
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(false);
+    expect(maintenance?.running).toBe(false);
+
+    await expect(
+      engine.drainInactiveCompactionDebt({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({
+      kind: "no_pending_debt",
+      pendingBefore: false,
+      pendingAfter: false,
+      backupPath: null,
+      rawMessageCount: messages.length,
+    });
+  });
+
+  it("refuses active offline debt targets and leaves their debt pending", async () => {
+    const engine = createEngine();
+    const conversation = await engine.getConversationStore().createConversation({
+      sessionId: "active-offline-debt-session",
+      sessionKey: "agent:main:test:active-offline-debt",
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 3_500,
+    });
+
+    const result = await engine.drainInactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+    });
+
+    expect(result).toMatchObject({ kind: "active", pendingBefore: true });
+    const maintenance = await engine
+      .getCompactionMaintenanceStore()
+      .getConversationCompactionMaintenance(conversation.conversationId);
+    expect(maintenance?.pending).toBe(true);
+  });
+
+  it("rechecks inactivity after waiting for the stable-session queue", async () => {
+    const engine = createEngine();
+    const conversation = await engine.getConversationStore().createConversation({
+      sessionId: "queued-offline-debt-session",
+      sessionKey: "agent:main:test:queued-offline-debt",
+      active: false,
+      archivedAt: new Date(),
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 3_500,
+    });
+    let releaseQueue!: () => void;
+    let queueAcquired!: () => void;
+    const acquired = new Promise<void>((resolve) => { queueAcquired = resolve; });
+    const blocker = (engine as unknown as {
+      withSessionQueue<T>(key: string, operation: () => Promise<T>): Promise<T>;
+    }).withSessionQueue(
+      conversation.sessionKey!,
+      async () => {
+        queueAcquired();
+        await new Promise<void>((resolve) => { releaseQueue = resolve; });
+      },
+    );
+    await acquired;
+
+    const drain = engine.drainInactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await engine.getConversationStore().rebindConversationSession(
+      conversation.conversationId,
+      conversation.sessionId,
+      conversation.sessionKey,
+    );
+    releaseQueue();
+    await blocker;
+
+    await expect(drain).resolves.toMatchObject({
+      kind: "active",
+      pendingBefore: true,
+      pendingAfter: true,
+      backupPath: null,
+    });
+  });
+
+  it("keeps offline debt pending when compaction does not converge", async () => {
+    const engine = createEngine();
+    const conversation = await engine.getConversationStore().createConversation({
+      sessionId: "failed-offline-debt-session",
+      active: false,
+      archivedAt: new Date(),
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 3_500,
+    });
+    vi.spyOn(
+      engine as unknown as { executeCompactionCore(params: unknown): Promise<unknown> },
+      "executeCompactionCore",
+    ).mockResolvedValue({
+      ok: false,
+      compacted: false,
+      reason: "summarizer failed",
+    });
+
+    const result = await engine.drainInactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+    });
+
+    expect(result).toMatchObject({
+      kind: "failed",
+      pendingBefore: true,
+      pendingAfter: true,
+      failureStage: "maintenance",
+      reason: "summarizer failed",
+    });
+    expect(result.backupPath).toBeTruthy();
+  });
+
+  it("does not start offline compaction when the backup is database-locked", async () => {
+    const engine = createEngine();
+    const conversation = await engine.getConversationStore().createConversation({
+      sessionId: "locked-offline-debt-session",
+      active: false,
+      archivedAt: new Date(),
+    });
+    await engine.getCompactionMaintenanceStore().requestProactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+      reason: "threshold",
+      tokenBudget: 4_096,
+      currentTokenCount: 3_500,
+    });
+    const executeCompactionCore = vi.spyOn(
+      engine as unknown as { executeCompactionCore(params: unknown): Promise<unknown> },
+      "executeCompactionCore",
+    );
+    const database = (engine as unknown as { db: { exec(sql: string): void } }).db;
+    vi.spyOn(database, "exec").mockImplementationOnce(() => {
+      throw new Error("database is locked");
+    });
+
+    const result = await engine.drainInactiveCompactionDebt({
+      conversationId: conversation.conversationId,
+    });
+
+    expect(result).toMatchObject({
+      kind: "failed",
+      pendingBefore: true,
+      pendingAfter: true,
+      backupPath: null,
+      failureStage: "backup",
+      reason: "database is locked",
+    });
+    expect(executeCompactionCore).not.toHaveBeenCalled();
+  });
+
+  it("returns non-mutating results for missing, debt-free, and already-drained targets", async () => {
+    const engine = createEngine();
+    await expect(
+      engine.drainInactiveCompactionDebt({ conversationId: 999_999 }),
+    ).resolves.toMatchObject({ kind: "missing", pendingBefore: false, pendingAfter: false });
+
+    const conversation = await engine.getConversationStore().createConversation({
+      sessionId: "debt-free-offline-session",
+      active: false,
+      archivedAt: new Date(),
+    });
+    await expect(
+      engine.drainInactiveCompactionDebt({ conversationId: conversation.conversationId }),
+    ).resolves.toMatchObject({ kind: "no_pending_debt", pendingBefore: false, pendingAfter: false });
+  });
+
   it("serialized clamp does not restore rejected prompt-separate assistant tails", () => {
     const rejectedTails = [
       { role: "assistant", content: "   " },
@@ -2129,6 +2365,7 @@ describe("LcmContextEngine maintain and assemble budget", () => {
     );
     const callArg = compactFullSweepSpy.mock.calls[0]![0] as Record<string, unknown>;
     expect(callArg).not.toHaveProperty("freshTailMaxTokens");
+    expect(callArg).not.toHaveProperty("allowZeroFreshTailOverride");
   });
 
   it("assemble emergency drain forwards force below the retry cap and stops at the cap", async () => {

@@ -53,6 +53,8 @@ The native OpenClaw command surface provides in-session operations:
 - `/lossless` shows version, enablement/selection state, DB path and size, summary counts, and summary-health status
 - `/lossless backup` creates a timestamped backup of the current LCM SQLite database
 - `/lossless rotate` rewrites the active session transcript into a compact tail-preserving form without changing the live OpenClaw session identity or current LCM conversation
+- `/lossless maintenance` reports pending compaction debt by active state and reason without modifying the database
+- `/lossless maintenance drain <conversation-id> confirm-offline` creates a database backup and finalizes one inactive conversation from its durable LCM messages while retaining every raw message row
 - `/lossless doctor` scans for broken or truncated summaries
 - `/lossless doctor apply` repairs broken summaries in the current conversation after the normal safety preflight
 - `/lossless doctor apply <conversation-id> confirm-offline` repairs a specific conversation after its active channel path has been paused or moved away; targeted repair is restricted to authorized OpenClaw command senders and always requires the explicit offline confirmation
@@ -65,6 +67,8 @@ Supported native command examples:
 - `/lossless`
 - `/lossless backup`
 - `/lossless rotate`
+- `/lossless maintenance`
+- `/lossless maintenance drain 42 confirm-offline`
 - `/lossless doctor`
 - `/lossless doctor apply 42 confirm-offline`
 - `/lossless doctor clean`
@@ -279,6 +283,8 @@ The `ignoreSessionPatterns` entries in this example are storage exclusions. Matc
 
 Transcript GC rewrites are disabled by default. Set `transcriptGcEnabled` or `LCM_TRANSCRIPT_GC_ENABLED` to turn them on explicitly.
 Deferred proactive compaction is also the default. Set `proactiveThresholdCompactionMode` or `LCM_PROACTIVE_THRESHOLD_COMPACTION_MODE` to `inline` only if you need legacy foreground compaction behavior. In deferred mode, lossless-claw records one coalesced prompt-mutating debt item after the turn, leaves background `maintain()` to process only non-prompt-mutating work while Anthropic cache is still hot, and then consumes that debt pre-assembly once the cache is cold or the prompt is approaching overflow.
+
+If a conversation is archived before that debt is consumed, use `/lossless maintenance` as the dry-run view. It groups active and inactive pending rows by reason and shows a bounded set of inactive conversation ids. Preview one target with `/lossless maintenance drain <conversation-id>`, then run `/lossless maintenance drain <conversation-id> confirm-offline` only after verifying the target is archived. The confirmed command refuses active conversations, creates a SQLite backup before compaction, and makes the normally protected fresh tail eligible for summarization from durable database content. It does not require a transcript file and does not delete raw messages. Missing targets, debt-free targets, backup failures, locking failures, summarizer failures, and incomplete convergence leave the operation non-destructive; failed convergence keeps the debt pending for diagnosis or retry.
 
 ### Expansion model override requirements
 

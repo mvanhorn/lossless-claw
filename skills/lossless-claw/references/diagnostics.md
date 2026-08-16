@@ -69,6 +69,21 @@ What it should help confirm:
 - whether truncation markers exist
 - which conversations are affected most
 
+### `/lossless maintenance`
+
+Use this read-only command when deferred compaction debt may have outlived an active runtime conversation. It groups pending rows by active/inactive state and reason, and shows a bounded set of inactive conversation examples. The scan does not run migrations, compaction, cleanup, or any other write.
+
+Use the single-target workflow rather than attempting a global sweep:
+
+1. Run `/lossless maintenance` and identify an inactive conversation id.
+2. Run `/lossless maintenance drain <conversation-id>` for a no-write preview.
+3. Verify the displayed target is inactive and the pending reason is expected.
+4. Run `/lossless maintenance drain <conversation-id> confirm-offline`.
+
+The confirmed drain queues on the conversation's stable session identity and rechecks inactivity after acquiring that queue. It refuses an active target, including one that became active while waiting. For an eligible target, Lossless Claw creates a timestamped SQLite backup and then converges deferred compaction directly from durable message rows without reading a transcript file. This explicit offline path makes the normally protected fresh tail eligible for summarization and configured condensation, but retains every raw message row.
+
+A missing conversation or a conversation with no pending debt is a non-mutating result. Backup or SQLite lock failure prevents compaction from starting. Summarizer failure or incomplete convergence keeps `pending=1` and reports the failure instead of claiming success. A second drain after successful convergence is an idempotent no-op.
+
 ### `/lossless doctor apply`
 
 Use this only after `/lossless doctor` identifies broken summaries. The command rewrites affected summary content in place after creating a database backup.
@@ -141,3 +156,4 @@ For MVP guidance:
 - Do not guess exact historical details from compacted context alone.
 - When a user wants a fact pattern verified, use recall tools to recover evidence.
 - Prefer changing one configuration knob at a time and then re-checking `/lossless`.
+- Never use the offline maintenance drain on an active conversation; pause or move delivery first and rely on the command's final queued inactivity check as a race guard, not as the initial isolation step.
